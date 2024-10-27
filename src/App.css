@@ -1,5 +1,10 @@
 .App {
   text-align: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 20px;
+  font-family: Arial, sans-serif;
 }
 
 .App-logo {
@@ -35,4 +40,42 @@
   to {
     transform: rotate(360deg);
   }
+}
+
+.input-container {
+  display: flex;
+  align-items: center;
+  margin-bottom: 20px;
+  width: 100%;
+  max-width: 600px; /* Limit the width for better appearance */
+}
+
+.search-input {
+  flex: 1;
+  padding: 10px;
+  border: 1px solid #ccc;
+  border-radius: 5px;
+  margin-right: 10px;
+}
+
+.submit-button, .speak-button {
+  padding: 10px 15px;
+  border: none;
+  border-radius: 5px;
+  background-color: #007bff;
+  color: white;
+  cursor: pointer;
+  margin-left: 5px;
+}
+
+.submit-button:hover, .speak-button:hover {
+  background-color: #0056b3;
+}
+
+.speak-button {
+  background-color: #28a745; /* Green for speak button */
+}
+
+.speak-button:hover {
+  background-color: #218838;
 }
