@@ -23,13 +23,33 @@ const JsonDisplay = ({ json }) => {
 
 function App() {
   const [userResponse, setUserResponse] = useState('');
-  const [currentQuestion, setCurrentQuestion] = useState('');
   const [loading, setLoading] = useState(false);
-  const [finalSubgenre, setFinalSubgenre] = useState([]); // This will hold the final subgenre
+  const [finalSubgenre, setFinalSubgenre] = useState([]);
   const [isRecording, setIsRecording] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
-  const [conversationContext, setConversationContext] = useState('');
+  const [conversationContext] = useState('');
   const [finalJson, setFinalJson] = useState(null);
+  const [streamingText, setStreamingText] = useState('');
+  const [promptTokens, setPromptTokens] = useState(0);
+  const [completionTokens, setCompletionTokens] = useState(0);
+  const [audioCharacters, setAudioCharacters] = useState(0);
+  const [speechTimeout, setSpeechTimeout] = useState(null);
+
+  // Constants for pricing (as of March 2024)
+  const PRICES = {
+    'gpt-4': 0.03 / 1000,   // $0.03 per 1K tokens for GPT-4 input
+    'gpt-4-output': 0.06 / 1000,   // $0.06 per 1K tokens for GPT-4 output
+    'tts-1': 0.015 / 1000,  // $0.015 per 1K characters
+  };
+
+  // Add token counting function
+  const calculateTokenCost = () => {
+    const inputCost = (promptTokens * PRICES['gpt-4']).toFixed(4);
+    const outputCost = (completionTokens * PRICES['gpt-4-output']).toFixed(4);
+    const audioCost = (audioCharacters * PRICES['tts-1']).toFixed(4);
+    const totalCost = (parseFloat(inputCost) + parseFloat(outputCost) + parseFloat(audioCost)).toFixed(4);
+    return { inputCost, outputCost, audioCost, totalCost };
+  };
 
   // Define categories and subcategories with blank descriptions
   const categories = {
@@ -161,17 +181,166 @@ function App() {
     }
   };
 
-  const speak = (text) => {
-    const utterance = new SpeechSynthesisUtterance(text);
-    utterance.onstart = () => setIsSpeaking(true); // Set speaking state to true
-    utterance.onend = () => setIsSpeaking(false); // Reset speaking state when done
-    window.speechSynthesis.speak(utterance);
+  // Modified generateSpeech with better timing control
+  const generateSpeech = async (text, shouldAutoRecord = true) => {
+    if (!text.trim()) return;
+    
+    try {
+      // Clear any existing timeout
+      if (speechTimeout) {
+        clearTimeout(speechTimeout);
+        setSpeechTimeout(null);
+      }
+      
+      // Ensure recording is stopped
+      setIsRecording(false);
+      
+      const response = await fetch('https://api.openai.com/v1/audio/speech', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${process.env.REACT_APP_OPENAI_API_KEY}`
+        },
+        body: JSON.stringify({
+          model: 'tts-1',
+          input: text,
+          voice: 'alloy',
+          speed: 1.0,
+          response_format: 'mp3'
+        })
+      });
+
+      if (!response.ok) {
+        throw new Error('Speech generation failed');
+      }
+
+      const characterCount = parseInt(response.headers.get('x-characters-used') || text.length);
+      setAudioCharacters(prev => prev + characterCount);
+
+      const audioBlob = await response.blob();
+      const audioUrl = URL.createObjectURL(audioBlob);
+      const audio = new Audio(audioUrl);
+      
+      return new Promise((resolve) => {
+        let playbackComplete = false;
+
+        audio.onplay = () => {
+          setIsSpeaking(true);
+          // Stop any ongoing recognition when speech starts
+          if (window.recognition) {
+            window.recognition.abort();
+          }
+        };
+        
+        audio.onended = () => {
+          playbackComplete = true;
+          setIsSpeaking(false);
+          URL.revokeObjectURL(audioUrl);
+          
+          // Only start listening if we should auto-record and haven't received final JSON
+          if (shouldAutoRecord && !finalJson) {
+            // Wait until speech is completely finished and state is updated
+            setTimeout(() => {
+              if (!finalJson && !isSpeaking && playbackComplete) {
+                startVoiceRecognition();
+              }
+            }, 1000);
+          }
+          resolve();
+        };
+
+        audio.play().catch(error => {
+          console.error('Error playing audio:', error);
+          setIsSpeaking(false);
+          playbackComplete = true;
+          resolve();
+        });
+      });
+    } catch (error) {
+      console.error('Error generating speech:', error);
+      setIsSpeaking(false);
+    }
   };
 
+  // Modified handleTextStream to prevent overlapping speech and recognition
+  const handleTextStream = async (reader, decoder) => {
+    try {
+      let currentMessage = '';
+      let sentenceBuffer = '';
+      
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        const chunk = decoder.decode(value);
+        const lines = chunk.split('\n').filter(line => line.trim() !== '');
+
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            const data = line.slice(6);
+            if (data === '[DONE]') continue;
+
+            try {
+              const parsed = JSON.parse(data);
+              
+              // Track usage if available
+              if (parsed.usage) {
+                setPromptTokens(prev => prev + parsed.usage.prompt_tokens);
+                setCompletionTokens(prev => prev + parsed.usage.completion_tokens);
+              }
+
+              const content = parsed.choices[0]?.delta?.content || '';
+              currentMessage += content;
+              sentenceBuffer += content;
+              
+              // Check for JSON response first
+              const jsonMatch = currentMessage.match(/{\s*"Category":\s*"(.*?)",\s*"Subcategory":\s*"(.*?)"\s*}/);
+              if (jsonMatch) {
+                const jsonResponse = {
+                  Category: jsonMatch[1],
+                  Subcategory: jsonMatch[2]
+                };
+                setFinalJson(jsonResponse);
+                setFinalSubgenre([jsonResponse.Subcategory]);
+                // Speak remaining text before JSON, but don't start recording after
+                if (sentenceBuffer.trim()) {
+                  await generateSpeech(sentenceBuffer, false); // Add parameter to prevent auto-recording
+                }
+                return;
+              }
+
+              // Update streaming text
+              setStreamingText(currentMessage);
+
+              // Only speak when we have complete sentences or enough content
+              const hasSentenceEnd = /[.!?]\s*$/.test(sentenceBuffer);
+              const hasEnoughContent = sentenceBuffer.length > 50;
+              
+              if (hasSentenceEnd || hasEnoughContent) {
+                await generateSpeech(sentenceBuffer, true); // Add parameter to enable auto-recording
+                sentenceBuffer = '';
+              }
+
+            } catch (error) {
+              console.error('Error parsing streaming response:', error);
+            }
+          }
+        }
+      }
+      
+      // Speak any remaining text in buffer
+      if (sentenceBuffer.trim()) {
+        await generateSpeech(sentenceBuffer, true);
+      }
+    } catch (error) {
+      console.error('Error in text stream:', error);
+    }
+  };
+
+  // Modified askOpenAI function to use streaming
   const askOpenAI = async (response) => {
     setLoading(true);
     try {
-      // Create a string of categories and their subcategories with descriptions
       const categoryDetails = Object.entries(categories)
         .map(([category, { active, description, subcategories }]) => {
           const subcategoryDetails = subcategories.map(sub => `${sub.name} - ${sub.description}`).join(', ');
@@ -179,17 +348,14 @@ function App() {
         })
         .join('\n');
 
-      // Print the categoryDetails string to the console
-      console.log(categoryDetails);
-
       const apiResponse = await fetch('https://api.openai.com/v1/chat/completions', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${process.env.REACT_APP_OPENAI_API_KEY}` // Use env variable for security
+          'Authorization': `Bearer ${process.env.REACT_APP_OPENAI_API_KEY}`
         },
         body: JSON.stringify({
-          model: 'gpt-4o-mini', // or any other model you prefer
+          model: 'gpt-4',
           messages: [
             {
               role: 'user',
@@ -201,34 +367,29 @@ function App() {
                 Category: [Category],
                 Subcategory: [Subcategory]
               }
-              This format clearly indicates the category and subcategory for each service. It will also stop the conversation and show the user the results based on the json. Feel free to stop the conversation after first request. For Example: If they say they are looking for a shelter for men, there is no need to ask them a follow up question.`
+              This format clearly indicates the category and subcategory for each service. It will also stop the conversation and show the user the results based on the json. Feel free to stop the conversation after first request. For Example: If they say they are looking for a shelter for men, there is no need to ask them a follow up question.
+              
+              For streaming responses: Pause briefly at the end of each sentence to allow for natural speech rhythm. If you need to ask a clarifying question, make it a single, clear question. When providing the final JSON response, output it as a complete block without pauses.`
             }
-          ]
+          ],
+          stream: true,
+          max_tokens: 150
         })
       });
 
-      const data = await apiResponse.json();
-      const nextQuestion = data.choices[0].message.content;
-
-      // Check if the response contains JSON
-      const jsonMatch = nextQuestion.match(/{\s*"Category":\s*"(.*?)",\s*"Subcategory":\s*"(.*?)"\s*}/);
-      if (jsonMatch) {
-        const jsonResponse = {
-          Category: jsonMatch[1],
-          Subcategory: jsonMatch[2]
-        };
-        setFinalJson(jsonResponse);
-        setFinalSubgenre([jsonResponse.Subcategory]); // Set the final subgenre based on the JSON response
-        window.speechSynthesis.cancel(); // Stop any ongoing speech
-      } else {
-        setCurrentQuestion(nextQuestion);
-        speak(nextQuestion);
-        setConversationContext(prev => `${prev} User: ${response}. AI: ${nextQuestion}.`);
+      if (!apiResponse.ok) {
+        throw new Error(`HTTP error! status: ${apiResponse.status}`);
       }
+
+      const reader = apiResponse.body.getReader();
+      const decoder = new TextDecoder('utf-8');
+      
+      // Start streaming the response
+      await handleTextStream(reader, decoder);
     } catch (error) {
       console.error('Error fetching from OpenAI:', error);
-      setCurrentQuestion('Sorry, there was an error processing your request.');
-      speak('Sorry, there was an error processing your request.');
+      setStreamingText('Sorry, there was an error processing your request.');
+      await generateSpeech('Sorry, there was an error processing your request.');
     } finally {
       setLoading(false);
     }
@@ -239,23 +400,101 @@ function App() {
     askOpenAI(response); // Pass the user response to OpenAI
   };
 
+  // Modified startVoiceRecognition to store recognition instance
   const startVoiceRecognition = () => {
-    console.log('Starting voice recognition...'); // Add this line
-    setUserResponse(''); // Clear the search bar text
-    setIsRecording(true); // Set recording state to true
+    if (isRecording || isSpeaking || finalJson) {
+      console.log('Skipping voice recognition start:', { isRecording, isSpeaking, hasFinalJson: !!finalJson });
+      return;
+    }
+    
+    console.log('Starting voice recognition...');
+    setIsRecording(true);
+    
     const recognition = new (window.SpeechRecognition || window.webkitSpeechRecognition)();
+    window.recognition = recognition;
+    
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    
+    let silenceTimer = null;
+    let hasSpeechStarted = false;
+    let finalTranscript = '';
+    let lastSpeechTime = Date.now();
+
+    recognition.onstart = () => {
+      console.log('Recognition started');
+      setUserResponse('');
+      finalTranscript = '';
+    };
+
+    recognition.onspeechstart = () => {
+      console.log('Speech started');
+      hasSpeechStarted = true;
+      lastSpeechTime = Date.now();
+      if (silenceTimer) {
+        clearTimeout(silenceTimer);
+        silenceTimer = null;
+      }
+    };
+
     recognition.onresult = (event) => {
-      const spokenResponse = event.results[0][0].transcript; // Capture spoken response
-      setUserResponse(spokenResponse); // Update state with spoken response
-      handleUserResponse(spokenResponse); // Process the response
+      lastSpeechTime = Date.now(); // Update last speech time with each result
+      let interimTranscript = '';
+      
+      // Build the interim transcript from all results
+      for (let i = 0; i < event.results.length; i++) {
+        const result = event.results[i];
+        if (result.isFinal) {
+          finalTranscript += result[0].transcript;
+        } else {
+          interimTranscript += result[0].transcript;
+        }
+      }
+
+      // Update the UI with both final and interim results
+      setUserResponse(finalTranscript + interimTranscript);
+      
+      // Reset silence timer
+      if (silenceTimer) clearTimeout(silenceTimer);
+      
+      silenceTimer = setTimeout(() => {
+        const silenceDuration = Date.now() - lastSpeechTime;
+        
+        // Only stop if we've had 2 seconds of silence after speech started
+        if (hasSpeechStarted && silenceDuration >= 2000) {
+          console.log('Silence detected, stopping recognition');
+          recognition.stop();
+          handleUserResponse(finalTranscript);
+        }
+      }, 2000); // Check every 2 seconds
     };
+
+    // Add speech end detection
+    recognition.onspeechend = () => {
+      console.log('Speech ended');
+      lastSpeechTime = Date.now();
+    };
+    
     recognition.onerror = (event) => {
-      console.error('Speech recognition error:', event.error); // Handle errors
+      console.error('Speech recognition error:', event.error);
+      setIsRecording(false);
+      if (silenceTimer) clearTimeout(silenceTimer);
     };
+    
     recognition.onend = () => {
-      setIsRecording(false); // Reset recording state when done
+      console.log('Recognition ended');
+      setIsRecording(false);
+      if (silenceTimer) clearTimeout(silenceTimer);
+      window.recognition = null; // Clear the reference
     };
-    recognition.start(); // Start voice recognition
+    
+    try {
+      recognition.start();
+    } catch (error) {
+      console.error('Error starting speech recognition:', error);
+      setIsRecording(false);
+      window.recognition = null;
+    }
   };
 
   const handleKeyPress = (event) => {
@@ -264,8 +503,39 @@ function App() {
     }
   };
 
+  // Add Usage Display component
+  const UsageDisplay = () => {
+    const costs = calculateTokenCost();
+    return (
+      <div className="usage-display" style={{ 
+        position: 'fixed', 
+        top: '10px', 
+        right: '10px',
+        background: 'rgba(0,0,0,0.8)',
+        color: 'white',
+        padding: '10px',
+        borderRadius: '5px',
+        fontSize: '12px'
+      }}>
+        <h4 style={{ margin: '0 0 5px 0' }}>Usage Metrics</h4>
+        <div>Prompt Tokens: {promptTokens}</div>
+        <div>Completion Tokens: {completionTokens}</div>
+        <div>Audio Characters: {audioCharacters}</div>
+        <div style={{ borderTop: '1px solid #666', marginTop: '5px', paddingTop: '5px' }}>
+          <div>Prompt Cost: ${costs.inputCost}</div>
+          <div>Completion Cost: ${costs.outputCost}</div>
+          <div>Audio Cost: ${costs.audioCost}</div>
+          <div style={{ fontWeight: 'bold', marginTop: '5px' }}>
+            Total Cost: ${costs.totalCost}
+          </div>
+        </div>
+      </div>
+    );
+  };
+
   return (
     <div className="App">
+      <UsageDisplay />
       <div className="input-container">
         <input
           type="text"
@@ -275,14 +545,26 @@ function App() {
           placeholder="Type your question here..."
           className="search-input"
         />
-        <button onClick={startVoiceRecognition} className="speak-button" disabled={loading || isSpeaking}>
+        <button 
+          onClick={startVoiceRecognition} 
+          className="speak-button" 
+          disabled={loading || isSpeaking}
+        >
           {isRecording ? 'Listening...' : '🎤'}
         </button>
       </div>
-      {isSpeaking && <p>AI is speaking...</p>}
-      {currentQuestion && <p>{currentQuestion}</p>}
-      {finalSubgenre.length > 0 && <ServiceDisplay services={finalSubgenre} />} {/* Use the new component */}
-      {finalJson && <JsonDisplay json={finalJson} />} {/* Render JsonDisplay when JSON is detected */}
+      {loading && <p>Processing...</p>}
+      {streamingText && !finalJson && (
+        <div className="streaming-response">
+          <p>{streamingText}</p>
+        </div>
+      )}
+      {finalJson && (
+        <>
+          <ServiceDisplay services={finalSubgenre} />
+          <JsonDisplay json={finalJson} />
+        </>
+      )}
     </div>
   );
 }
