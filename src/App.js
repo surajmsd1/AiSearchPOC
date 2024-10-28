@@ -65,7 +65,7 @@ function App() {
     },
     food: {
       active: true,
-      description: "", // Blank description
+      description: "only need to differentiate between cooked food and groceries", // Blank description
       subcategories: [
         {
           name: "cooked food",
@@ -128,7 +128,7 @@ function App() {
       ]
     },
     jobsandtraining: {
-      active: false, // Example of an inactive category
+      active: true, // Example of an inactive category
       description: "", // Blank description
       subcategories: [
         { name: "resume help", description: "" }, 
@@ -137,7 +137,7 @@ function App() {
       ]
     },
     otherservices: {
-      active: false, // Example of an inactive category
+      active: true, // Example of an inactive category
       description: "", // Blank description
       subcategories: [
         { name: "Addiction", description: "" }, 
